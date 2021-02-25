@@ -11,6 +11,7 @@ Arguments:
 
 Options:
     -h, --help                  show help message
+    -o FILE, --output FILE      output filename [default: -]
     --context-name NAME         column name for the context (group).
     --category-name NAME        column name of the category of the count
     --first-sample-column N     the first column (counting from 1) for sample counts
@@ -21,9 +22,24 @@ from intervaltree import Interval, IntervalTree
 from gtfparse import read_gtf
 import pandas
 
+import gzip
 import subprocess
 
 __version__ = "0.0.1"
+
+def smart_open(filename, mode="rt"):
+    if filename == "-":
+        if 'r' in mode:
+            return sys.stdin
+        elif 'w' in mode:
+            return sys.stdout
+        else:
+            raise SmartOpenError(f"unable to open '-' in mode '{mode}'")
+
+    if filename.endswith(".gz"):
+        return gzip.open(filename, mode)
+
+    return open(filename, mode)
 
 class atoms(object):
     def __init__(self, transform = None):
@@ -88,7 +104,6 @@ def estimate_gamma(xs, biasCorrection = False):
     return (kHat, thetaHat)
 
 def counts(bam_filename : str, genome_fasta : str):
-    print(f"running: {' '.join(['samtools', 'mpileup', '-f', genome_fasta, bam_filename])}")
     p = subprocess.Popen(['samtools', 'mpileup', '-f', genome_fasta, bam_filename], stdout=subprocess.PIPE)
     chroms = atoms(lambda s: s.decode('ascii'))
     dec = pileup_decoder()
@@ -121,6 +136,8 @@ class segement_index(object):
     def __init__(self, annot):
         wanted = {'gene', 'transcript', 'exon'}
 
+        self.gene_names = {}
+
         pos_sets = {}
         for ftr in annot.iterrows():
             ftr_type = ftr[1]['feature']
@@ -132,6 +149,9 @@ class segement_index(object):
 
             if ftr_type == 'exon':
                 gene_id = ftr[1]['gene_id']
+                gene_nm = ftr[1]['gene_name']
+                self.gene_names[gene_id] = (gene_nm, chrom)
+
                 if chrom not in pos_sets:
                     pos_sets[chrom] = {}
                 if gene_id not in pos_sets[chrom]:
@@ -150,6 +170,7 @@ class segement_index(object):
 
         self.segs = {}
         self.gene_segs = {}
+        self.seg_idx = {}
         for chrom in pos_sets.keys():
             self.segs[chrom] = IntervalTree()
             for gene_id in pos_sets[chrom]:
@@ -159,10 +180,12 @@ class segement_index(object):
                     ps.add(ivl[1])
                 ps = sorted(ps)
                 self.gene_segs[gene_id] = len(ps) - 1
+                self.seg_idx[gene_id] = []
                 for i in range(1, len(ps)):
                     st = ps[i - 1]
                     en = ps[i]
                     self.segs[chrom][st:en] = (gene_id, i-1)
+                    self.seg_idx[gene_id].push_back((st, en))
 
     def length(self, gene_id):
         return self.gene_segs[gene_id]
@@ -172,37 +195,18 @@ class segement_index(object):
             return set()
         return self.segs[chrom][pos]
 
-def index_features(annot):
-    wanted = {'gene', 'transcript', 'exon'}
-    idx = {}
-    for ftr in annot.iterrows():
-        ftr_type = ftr[1]['feature']
-        if ftr_type not in wanted:
-            continue
-        chrom = ftr[1]['seqname']
-        begin = ftr[1]['start']
-        end = ftr[1]['end'] + 1
-        gene = ftr[1]['gene_name']
+    def gene_name(self, gene_id):
+        return self.gene_names[gene_id]
 
-        ftr_ctxt = None
-        if ftr_type == 'gene':
-            ftr_ctxt = ftr[1]['gene_id']
-        elif ftr_type == 'transcript':
-            ftr_ctxt = ftr[1]['transcript_id']
-        else:
-            ftr_ctxt = ftr[1]['transcript_id']
-
-        if chrom not in idx:
-            idx[chrom] = IntervalTree()
-        idx[chrom][begin:end] = (gene, ftr_type, ftr_ctxt)
-    return idx
+    def gene_segments(self, gene_id):
+        return self.seg_idx[gene_id]
 
 def scanbam(opts):
     annot = read_gtf(opts["<annotation>"])
     idx = segement_index(annot)
 
+    res = {}
     for bamName in opts["<bam>"]:
-        res = {}
         print(bamName)
         print(opts["<reference>"])
         for t in counts(bamName, opts["<reference>"]):
@@ -224,10 +228,15 @@ def scanbam(opts):
                 if cov not in res[gene][seg]:
                     res[gene][seg][cov] = 0
                 res[gene][seg][cov] += 1
-        for gene in sorted(res.keys()):
-            for i in range(len(res[gene])):
-                for (c,f) in sorted(res[gene][i].items()):
-                    print(f"{gene}\t{i}\t{c}\t{f}")
+    with smart_open(opts['--output'], "wt") as out:
+        print(f"name\tid\tsegment\tchrom\tbegin\tend\tcoverage\tfrequency", file=out)
+        for gene_id in sorted(res.keys()):
+            (gene_nm, chrom) = idx.gene_name(gene_id)
+            gene_segs = idx.gene_segments(gene_id)
+            for i in range(len(res[gene_id])):
+                seg = gene_segs[i]
+                for (c,f) in sorted(res[gene_id][i].items()):
+                    print(f"{gene_nm}\t{gene_id}\t{i}\t{chrom}\t{seg[0]}\t{seg[1]}\t{c}\t{f}", file=out)
 
 def consmodel(opts):
     dat = pandas.read_table(opts['<counts-file>'])
