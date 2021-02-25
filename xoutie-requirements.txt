@@ -1,0 +1,4 @@
+docopt
+intervaltree
+pandas
+gtfparse
