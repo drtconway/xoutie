@@ -185,7 +185,7 @@ class segement_index(object):
                     st = ps[i - 1]
                     en = ps[i]
                     self.segs[chrom][st:en] = (gene_id, i-1)
-                    self.seg_idx[gene_id].push_back((st, en))
+                    self.seg_idx[gene_id].append((st, en))
 
     def length(self, gene_id):
         return self.gene_segs[gene_id]
